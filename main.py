@@ -11,26 +11,34 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ASSISTANT_ID = os.environ["ASSISTANT_ID"]
 
+# Временное хранилище: chat_id -> thread_id
+user_threads = {}
+
 @app.post("/ask")
 async def ask(request: Request):
     try:
         body = await request.json()
         user_text = body["text"]
-        chat_id = body["chat_id"]
+        chat_id = str(body["chat_id"])  # убедимся, что строка
 
         async with httpx.AsyncClient() as client:
-            # 1. Create thread
-            thread_resp = await client.post(
-                "https://api.openai.com/v1/threads",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "OpenAI-Beta": "assistants=v2",
-                    "Content-Type": "application/json"
-                }
-            )
-            thread_id = thread_resp.json()["id"]
+            # 1. Получить или создать thread_id
+            if chat_id in user_threads:
+                thread_id = user_threads[chat_id]
+            else:
+                thread_resp = await client.post(
+                    "https://api.openai.com/v1/threads",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "OpenAI-Beta": "assistants=v2",
+                        "Content-Type": "application/json"
+                    }
+                )
+                thread_id = thread_resp.json()["id"]
+                user_threads[chat_id] = thread_id
+                print(f"🧵 Создан новый thread: {thread_id} для chat_id: {chat_id}")
 
-            # 2. Post message
+            # 2. Отправить сообщение
             await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={
@@ -44,7 +52,7 @@ async def ask(request: Request):
                 }
             )
 
-            # 3. Start run
+            # 3. Запустить run
             run_resp = await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/runs",
                 headers={
@@ -56,8 +64,8 @@ async def ask(request: Request):
             )
             run_id = run_resp.json()["id"]
 
-            # 4. Poll run status (с меньшей задержкой)
-            for _ in range(30):  # до 9 секунд ожидания
+            # 4. Ожидание завершения run
+            for _ in range(30):
                 run_status_resp = await client.get(
                     f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}",
                     headers={
@@ -70,7 +78,7 @@ async def ask(request: Request):
                     break
                 await asyncio.sleep(0.3)
 
-            # 5. Get messages
+            # 5. Получение сообщений
             messages_resp = await client.get(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={
@@ -80,13 +88,13 @@ async def ask(request: Request):
             )
             messages = messages_resp.json()["data"]
 
-            # DEBUG: покажем все роли и куски content
+            # DEBUG
             print("📨 THREAD MESSAGES:")
             for msg in messages:
                 print(f" - role: {msg['role']}")
                 print(f"   content: {msg.get('content')}")
 
-            # 6. Найдём первый текст от ассистента
+            # 6. Извлечь первый текст от ассистента
             assistant_reply = "🤖 Ошибка: ассистент не сгенерировал текстовый ответ."
             for msg in messages:
                 if msg["role"] == "assistant" and "content" in msg:
@@ -97,7 +105,7 @@ async def ask(request: Request):
                 if assistant_reply != "🤖 Ошибка: ассистент не сгенерировал текстовый ответ.":
                     break
 
-            # 7. Отправим в Telegram
+            # 7. Отправить в Telegram
             await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={
