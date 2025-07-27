@@ -5,15 +5,16 @@ import httpx
 import os
 import asyncio
 import json
+import traceback
 
 app = FastAPI()
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ASSISTANT_ID = os.environ["ASSISTANT_ID"]
+NOTION_PROXY_URL = os.environ.get("NOTION_PROXY_URL", "http://localhost:8001")  # Поддержка внешнего адреса
 
-# Временное хранилище: chat_id -> thread_id
-user_threads = {}
+user_threads = {}  # chat_id -> thread_id
 
 @app.post("/ask")
 async def ask(request: Request):
@@ -22,11 +23,15 @@ async def ask(request: Request):
         user_text = body["text"]
         chat_id = str(body["chat_id"])
 
+        print(f"📨 Получен запрос от {chat_id}: {user_text}")
+
         async with httpx.AsyncClient() as client:
             # 1. Получить или создать thread
             if chat_id in user_threads:
                 thread_id = user_threads[chat_id]
+                print(f"🔁 Используем существующий thread: {thread_id}")
             else:
+                print(f"➕ Создаём новый thread для chat_id: {chat_id}")
                 thread_resp = await client.post(
                     "https://api.openai.com/v1/threads",
                     headers={
@@ -37,8 +42,10 @@ async def ask(request: Request):
                 )
                 thread_id = thread_resp.json()["id"]
                 user_threads[chat_id] = thread_id
+                print(f"✅ Новый thread: {thread_id}")
 
-            # 2. Отправить сообщение
+            # 2. Отправка сообщения
+            print("📤 Отправляем сообщение ассистенту...")
             await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={
@@ -49,7 +56,8 @@ async def ask(request: Request):
                 json={"role": "user", "content": user_text}
             )
 
-            # 3. Запустить run
+            # 3. Запуск run
+            print("▶️ Запускаем run...")
             run_resp = await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/runs",
                 headers={
@@ -61,9 +69,10 @@ async def ask(request: Request):
             )
             run = run_resp.json()
             run_id = run["id"]
+            print(f"🚦 Run ID: {run_id}")
 
-            # 4. Ожидание завершения run или requires_action
-            for _ in range(30):
+            # 4. Ждём завершения run или actions
+            for i in range(30):
                 run_status_resp = await client.get(
                     f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}",
                     headers={
@@ -73,24 +82,35 @@ async def ask(request: Request):
                 )
                 run_status = run_status_resp.json()
                 status_ = run_status["status"]
+                print(f"⏳ [{i}] Статус run: {status_}")
 
                 if status_ in ["completed", "failed"]:
+                    print(f"✅ Run завершён: {status_}")
                     break
 
                 elif status_ == "requires_action":
+                    print("🛠 Требуются действия: запускаем tool calls...")
                     tool_calls = run_status["required_action"]["submit_tool_outputs"]["tool_calls"]
 
                     tool_outputs = []
                     for call in tool_calls:
                         function_name = call["function"]["name"]
                         arguments = json.loads(call["function"]["arguments"])
+                        print(f"🔧 Вызов функции: {function_name} с аргументами: {arguments}")
 
-                        # 👉 Здесь вызываем настоящий эндпоинт Notion Proxy
-                        notion_response = await client.post(
-                            f"http://notion-proxy:8000/{function_name}",  # Docker internal URL
-                            json=arguments
-                        )
-                        notion_result = notion_response.json()
+                        try:
+                            notion_response = await client.post(
+                                f"{NOTION_PROXY_URL}/{function_name}",
+                                json=arguments,
+                                timeout=10.0
+                            )
+                            notion_response.raise_for_status()
+                            notion_result = notion_response.json()
+                            print(f"✅ Ответ от прокси: {notion_result}")
+                        except Exception as e:
+                            print(f"❌ Ошибка вызова прокси-функции {function_name}: {e}")
+                            traceback.print_exc()
+                            notion_result = {"error": str(e)}
 
                         tool_outputs.append({
                             "tool_call_id": call["id"],
@@ -106,10 +126,10 @@ async def ask(request: Request):
                         },
                         json={"tool_outputs": tool_outputs}
                     )
-
                 await asyncio.sleep(0.3)
 
-            # 5. Получить результат
+            # 5. Получаем ответ
+            print("📩 Получаем сообщения...")
             messages_resp = await client.get(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={
@@ -128,6 +148,8 @@ async def ask(request: Request):
                             break
                     break
 
+            print(f"📨 Ответ ассистента: {assistant_reply}")
+
             # 6. Ответ в Telegram
             await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -138,14 +160,17 @@ async def ask(request: Request):
 
     except Exception as e:
         print("❌ ERROR:", str(e))
+        traceback.print_exc()
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"error": str(e)}
         )
 
+
 @app.api_route("/ping", methods=["GET", "HEAD"])
 async def ping():
     return {"status": "alive"}
+
 
 if __name__ == "__main__":
     import uvicorn
