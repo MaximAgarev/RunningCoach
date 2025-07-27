@@ -39,9 +39,8 @@ class UpdateStatusFlexibleRequest(BaseModel):
     page_id: str
     fields: dict
 
-# --- Notion-related functions ---
-@app.post("/createStatus", name="createStatus")
-def createStatus(data: CreateStatusRequest):
+# --- Reusable Notion logic ---
+def create_status(data: CreateStatusRequest):
     properties = {
         "Статус": {
             "title": [{"text": {"content": data.status}}]
@@ -59,12 +58,10 @@ def createStatus(data: CreateStatusRequest):
         "parent": {"database_id": STATUS_DATABASE_ID},
         "properties": properties
     }
-
     response = httpx.post("https://api.notion.com/v1/pages", headers=notion_headers, json=body)
     return response.json()
 
-@app.patch("/updateStatus", name="updateStatus")
-def updateStatus(data: UpdateStatusFlexibleRequest):
+def update_status(data: UpdateStatusFlexibleRequest):
     body = {"properties": data.fields}
     response = httpx.patch(
         f"https://api.notion.com/v1/pages/{data.page_id}",
@@ -73,11 +70,7 @@ def updateStatus(data: UpdateStatusFlexibleRequest):
     )
     return response.json()
 
-@app.get("/getStatuses", name="getStatuses")
-def getStatuses(
-    active_only: bool = Query(False),
-    limit: int = Query(0)
-):
+def get_statuses(active_only: bool = False, limit: int = 0):
     payload = {
         "sorts": [{"property": "Дата начала", "direction": "descending"}]
     }
@@ -119,6 +112,19 @@ def getStatuses(
 
     return results
 
+# --- FastAPI route wrappers (optional, kept for manual API use) ---
+@app.post("/createStatus")
+def route_create_status(data: CreateStatusRequest):
+    return create_status(data)
+
+@app.patch("/updateStatus")
+def route_update_status(data: UpdateStatusFlexibleRequest):
+    return update_status(data)
+
+@app.get("/getStatuses")
+def route_get_statuses(active_only: bool = Query(False), limit: int = Query(0)):
+    return get_statuses(active_only, limit)
+
 # --- Telegram + OpenAI Assistant endpoint ---
 user_threads = {}
 
@@ -130,7 +136,6 @@ async def ask(request: Request):
         chat_id = str(body["chat_id"])
 
         async with httpx.AsyncClient() as client:
-            # 1. Get or create thread
             if chat_id in user_threads:
                 thread_id = user_threads[chat_id]
             else:
@@ -145,7 +150,6 @@ async def ask(request: Request):
                 thread_id = thread_resp.json()["id"]
                 user_threads[chat_id] = thread_id
 
-            # 2. Send user message
             await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={
@@ -156,7 +160,6 @@ async def ask(request: Request):
                 json={"role": "user", "content": user_text}
             )
 
-            # 3. Start assistant run
             run_resp = await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/runs",
                 headers={
@@ -168,7 +171,6 @@ async def ask(request: Request):
             )
             run_id = run_resp.json()["id"]
 
-            # 4. Wait for completion or actions
             for _ in range(30):
                 status_resp = await client.get(
                     f"https://api.openai.com/v1/threads/{thread_id}/runs/{run_id}",
@@ -211,7 +213,6 @@ async def ask(request: Request):
                     )
                 await asyncio.sleep(0.3)
 
-            # 5. Get final assistant message
             messages_resp = await client.get(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "assistants=v2"}
@@ -227,7 +228,6 @@ async def ask(request: Request):
                             break
                     break
 
-            # 6. Reply to Telegram
             await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": chat_id, "text": assistant_reply}
