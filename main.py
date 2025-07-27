@@ -40,7 +40,8 @@ class UpdateStatusFlexibleRequest(BaseModel):
     fields: dict
 
 # --- Notion-related functions ---
-def create_status(data: CreateStatusRequest):
+@app.post("/createStatus", name="createStatus")
+def createStatus(data: CreateStatusRequest):
     properties = {
         "Статус": {
             "title": [{"text": {"content": data.status}}]
@@ -62,7 +63,8 @@ def create_status(data: CreateStatusRequest):
     response = httpx.post("https://api.notion.com/v1/pages", headers=notion_headers, json=body)
     return response.json()
 
-def update_status(data: UpdateStatusFlexibleRequest):
+@app.patch("/updateStatus", name="updateStatus")
+def updateStatus(data: UpdateStatusFlexibleRequest):
     body = {"properties": data.fields}
     response = httpx.patch(
         f"https://api.notion.com/v1/pages/{data.page_id}",
@@ -71,7 +73,11 @@ def update_status(data: UpdateStatusFlexibleRequest):
     )
     return response.json()
 
-def get_statuses(active_only: bool = False, limit: int = 0):
+@app.get("/getStatuses", name="getStatuses")
+def getStatuses(
+    active_only: bool = Query(False),
+    limit: int = Query(0)
+):
     payload = {
         "sorts": [{"property": "Дата начала", "direction": "descending"}]
     }
