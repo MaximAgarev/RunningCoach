@@ -1,15 +1,14 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from fastapi import status
 import httpx
 import os
 import asyncio
 
 app = FastAPI()
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ASSISTANT_ID = os.environ["ASSISTANT_ID"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+ASSISTANT_ID = os.environ.get("ASSISTANT_ID")
 
 # Временное хранилище: chat_id -> thread_id
 user_threads = {}
@@ -18,10 +17,14 @@ user_threads = {}
 async def ask(request: Request):
     try:
         body = await request.json()
-        user_text = body["text"]
-        chat_id = str(body["chat_id"])  # убедимся, что строка
+        user_text = body.get("text")
+        chat_id = str(body.get("chat_id"))
+
+        if not user_text or not chat_id:
+            return JSONResponse(status_code=400, content={"error": "Missing text or chat_id"})
 
         async with httpx.AsyncClient() as client:
+
             # 1. Получить или создать thread_id
             if chat_id in user_threads:
                 thread_id = user_threads[chat_id]
@@ -34,12 +37,21 @@ async def ask(request: Request):
                         "Content-Type": "application/json"
                     }
                 )
-                thread_id = thread_resp.json()["id"]
+
+                if thread_resp.status_code != 200:
+                    print("❌ Ошибка создания thread:", thread_resp.text)
+                    return JSONResponse(status_code=500, content={"error": thread_resp.text})
+
+                thread_data = thread_resp.json()
+                thread_id = thread_data.get("id")
+                if not thread_id:
+                    return JSONResponse(status_code=500, content={"error": "No thread ID returned"})
+                
                 user_threads[chat_id] = thread_id
                 print(f"🧵 Создан новый thread: {thread_id} для chat_id: {chat_id}")
 
             # 2. Отправить сообщение
-            await client.post(
+            msg_resp = await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/messages",
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -52,6 +64,10 @@ async def ask(request: Request):
                 }
             )
 
+            if msg_resp.status_code != 200:
+                print("❌ Ошибка отправки сообщения:", msg_resp.text)
+                return JSONResponse(status_code=500, content={"error": msg_resp.text})
+
             # 3. Запустить run
             run_resp = await client.post(
                 f"https://api.openai.com/v1/threads/{thread_id}/runs",
@@ -62,7 +78,15 @@ async def ask(request: Request):
                 },
                 json={"assistant_id": ASSISTANT_ID}
             )
-            run_id = run_resp.json()["id"]
+
+            if run_resp.status_code != 200:
+                print("❌ Ошибка запуска run:", run_resp.text)
+                return JSONResponse(status_code=500, content={"error": run_resp.text})
+
+            run_data = run_resp.json()
+            run_id = run_data.get("id")
+            if not run_id:
+                return JSONResponse(status_code=500, content={"error": "No run ID returned"})
 
             # 4. Ожидание завершения run
             for _ in range(30):
@@ -73,8 +97,13 @@ async def ask(request: Request):
                         "OpenAI-Beta": "assistants=v2"
                     }
                 )
+
+                if run_status_resp.status_code != 200:
+                    print("❌ Ошибка проверки статуса run:", run_status_resp.text)
+                    return JSONResponse(status_code=500, content={"error": run_status_resp.text})
+
                 run_status = run_status_resp.json()
-                if run_status["status"] == "completed":
+                if run_status.get("status") == "completed":
                     break
                 await asyncio.sleep(0.3)
 
@@ -86,27 +115,32 @@ async def ask(request: Request):
                     "OpenAI-Beta": "assistants=v2"
                 }
             )
-            messages = messages_resp.json()["data"]
+
+            if messages_resp.status_code != 200:
+                print("❌ Ошибка получения сообщений:", messages_resp.text)
+                return JSONResponse(status_code=500, content={"error": messages_resp.text})
+
+            messages = messages_resp.json().get("data", [])
 
             # DEBUG
             print("📨 THREAD MESSAGES:")
             for msg in messages:
-                print(f" - role: {msg['role']}")
+                print(f" - role: {msg.get('role')}")
                 print(f"   content: {msg.get('content')}")
 
-            # 6. Извлечь первый текст от ассистента
+            # 6. Извлечь ответ ассистента
             assistant_reply = "🤖 Ошибка: ассистент не сгенерировал текстовый ответ."
             for msg in messages:
-                if msg["role"] == "assistant" and "content" in msg:
-                    for part in msg["content"]:
-                        if part["type"] == "text":
+                if msg.get("role") == "assistant":
+                    for part in msg.get("content", []):
+                        if part.get("type") == "text":
                             assistant_reply = part["text"]["value"]
                             break
                 if assistant_reply != "🤖 Ошибка: ассистент не сгенерировал текстовый ответ.":
                     break
 
             # 7. Отправить в Telegram
-            await client.post(
+            tg_resp = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={
                     "chat_id": chat_id,
@@ -114,10 +148,13 @@ async def ask(request: Request):
                 }
             )
 
+            if tg_resp.status_code != 200:
+                print("❌ Ошибка отправки в Telegram:", tg_resp.text)
+
         return {"status": "ok"}
 
     except Exception as e:
-        print("❌ ERROR:", str(e))
+        print("❌ Общая ошибка:", str(e))
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"error": str(e)}
