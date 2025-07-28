@@ -108,15 +108,56 @@ def get_statuses(active_only: bool = False, limit: int = 0):
         next_cursor = data.get("next_cursor")
     return results
 
-def get_plans():
+def get_plans(limit: int = 0):
+    payload = {"sorts": [{"property": "Дата", "direction": "ascending"}]}
     url = f"https://api.notion.com/v1/databases/{PLAN_DATABASE_ID}/query"
-    response = httpx.post(url, headers=notion_headers, json={})
-    return response.json()
+    results, has_more, next_cursor = [], True, None
+    while has_more:
+        if next_cursor:
+            payload["start_cursor"] = next_cursor
+        response = httpx.post(url, headers=notion_headers, json=payload)
+        data = response.json()
+        for page in data.get("results", []):
+            props = page["properties"]
+            results.append({
+                "id": page["id"],
+                "Дата": props["Дата"]["date"]["start"] if props["Дата"]["date"] else None,
+                "Тип": props["Тип"]["select"]["name"] if props["Тип"]["select"] else None,
+                "Задание": props["Задание"]["rich_text"][0]["text"]["content"] if props["Задание"]["rich_text"] else None,
+                "Комментарий": props["Комментарий"]["rich_text"][0]["text"]["content"] if props["Комментарий"]["rich_text"] else None,
+                "Факт": [rel["id"] for rel in props["Факт"]["relation"]] if props["Факт"]["relation"] else []
+            })
+            if limit and len(results) >= limit:
+                return results[:limit]
+        has_more = data.get("has_more", False)
+        next_cursor = data.get("next_cursor")
+    return results
 
-def get_runs():
+def get_runs(limit: int = 0):
+    payload = {"sorts": [{"property": "Дата", "direction": "descending"}]}
     url = f"https://api.notion.com/v1/databases/{RUN_DATABASE_ID}/query"
-    response = httpx.post(url, headers=notion_headers, json={})
-    return response.json()
+    results, has_more, next_cursor = [], True, None
+    while has_more:
+        if next_cursor:
+            payload["start_cursor"] = next_cursor
+        response = httpx.post(url, headers=notion_headers, json=payload)
+        data = response.json()
+        for page in data.get("results", []):
+            props = page["properties"]
+            results.append({
+                "id": page["id"],
+                "Дата": props["Дата"]["date"]["start"] if props["Дата"]["date"] else None,
+                "Время (мин)": props["Время (мин)"]["number"],
+                "Дистанция (км)": props["Дистанция (км)"]["number"],
+                "Самочувствие": props["Самочувствие"]["rich_text"][0]["text"]["content"] if props["Самочувствие"]["rich_text"] else None,
+                "Комментарий": props["Комментарий"]["rich_text"][0]["text"]["content"] if props["Комментарий"]["rich_text"] else None,
+                "План": [rel["id"] for rel in props["План"]["relation"]] if props["План"]["relation"] else []
+            })
+            if limit and len(results) >= limit:
+                return results[:limit]
+        has_more = data.get("has_more", False)
+        next_cursor = data.get("next_cursor")
+    return results
 
 # --- FastAPI route wrappers ---
 @app.post("/createStatus")
@@ -132,12 +173,12 @@ def route_get_statuses(active_only: bool = Query(False), limit: int = Query(0)):
     return get_statuses(active_only, limit)
 
 @app.get("/getPlans")
-def route_get_plans():
-    return get_plans()
+def route_get_plans(limit: int = Query(0)):
+    return get_plans(limit)
 
 @app.get("/getRuns")
-def route_get_runs():
-    return get_runs()
+def route_get_runs(limit: int = Query(0)):
+    return get_runs(limit)
 
 @app.post("/createPlan")
 def route_create_plan(data: CreatePageRequest):
