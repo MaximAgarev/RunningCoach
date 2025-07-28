@@ -18,6 +18,8 @@ ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_VERSION = "2022-06-28"
 STATUS_DATABASE_ID = "2229a1646ce180ff8fe3cb424fb6ef6c"
+PLAN_DATABASE_ID = "23d9a1646ce18016b67fe46842dec598"
+RUN_DATABASE_ID = "2229a1646ce1811ab7cfe8441534fbad"
 
 # --- App initialization ---
 app = FastAPI()
@@ -39,42 +41,44 @@ class UpdateStatusFlexibleRequest(BaseModel):
     page_id: str
     fields: dict
 
-# --- Reusable Notion logic ---
-def create_status(data: CreateStatusRequest):
-    properties = {
-        "Статус": {
-            "title": [{"text": {"content": data.status}}]
-        },
-        "Дата начала": {
-            "date": {"start": data.start_date}
-        }
-    }
-    if isinstance(data.end_date, str) and data.end_date.strip():
-        properties["Дата окончания"] = {
-            "date": {"start": data.end_date}
-        }
+class UpdatePageRequest(BaseModel):
+    page_id: str
+    fields: dict
 
-    body = {
-        "parent": {"database_id": STATUS_DATABASE_ID},
-        "properties": properties
-    }
+class CreatePageRequest(BaseModel):
+    database_id: str
+    properties: dict
+
+# --- Reusable Notion logic ---
+def create_page(database_id: str, properties: dict):
+    body = {"parent": {"database_id": database_id}, "properties": properties}
     response = httpx.post("https://api.notion.com/v1/pages", headers=notion_headers, json=body)
     return response.json()
 
-def update_status(data: UpdateStatusFlexibleRequest):
-    body = {"properties": data.fields}
+def update_page(page_id: str, fields: dict):
+    body = {"properties": fields}
     response = httpx.patch(
-        f"https://api.notion.com/v1/pages/{data.page_id}",
+        f"https://api.notion.com/v1/pages/{page_id}",
         headers=notion_headers,
         json=body
     )
     return response.json()
 
-def get_statuses(active_only: bool = False, limit: int = 0):
-    payload = {
-        "sorts": [{"property": "Дата начала", "direction": "descending"}]
+# --- Status logic ---
+def create_status(data: CreateStatusRequest):
+    properties = {
+        "Статус": {"title": [{"text": {"content": data.status}}]},
+        "Дата начала": {"date": {"start": data.start_date}}
     }
+    if isinstance(data.end_date, str) and data.end_date.strip():
+        properties["Дата окончания"] = {"date": {"start": data.end_date}}
+    return create_page(STATUS_DATABASE_ID, properties)
 
+def update_status(data: UpdateStatusFlexibleRequest):
+    return update_page(data.page_id, data.fields)
+
+def get_statuses(active_only: bool = False, limit: int = 0):
+    payload = {"sorts": [{"property": "Дата начала", "direction": "descending"}]}
     if active_only:
         today = date.today().isoformat()
         payload["filter"] = {
@@ -83,19 +87,13 @@ def get_statuses(active_only: bool = False, limit: int = 0):
                 {"property": "Дата окончания", "date": {"is_empty": True}}
             ]
         }
-
     url = f"https://api.notion.com/v1/databases/{STATUS_DATABASE_ID}/query"
-    results = []
-    has_more = True
-    next_cursor = None
-
+    results, has_more, next_cursor = [], True, None
     while has_more:
         if next_cursor:
             payload["start_cursor"] = next_cursor
-
         response = httpx.post(url, headers=notion_headers, json=payload)
         data = response.json()
-
         for page in data.get("results", []):
             props = page["properties"]
             results.append({
@@ -106,13 +104,21 @@ def get_statuses(active_only: bool = False, limit: int = 0):
             })
             if limit and len(results) >= limit:
                 return results[:limit]
-
         has_more = data.get("has_more", False)
         next_cursor = data.get("next_cursor")
-
     return results
 
-# --- FastAPI route wrappers (optional, kept for manual API use) ---
+def get_plans():
+    url = f"https://api.notion.com/v1/databases/{PLAN_DATABASE_ID}/query"
+    response = httpx.post(url, headers=notion_headers, json={})
+    return response.json()
+
+def get_runs():
+    url = f"https://api.notion.com/v1/databases/{RUN_DATABASE_ID}/query"
+    response = httpx.post(url, headers=notion_headers, json={})
+    return response.json()
+
+# --- FastAPI route wrappers ---
 @app.post("/createStatus")
 def route_create_status(data: CreateStatusRequest):
     return create_status(data)
@@ -124,6 +130,30 @@ def route_update_status(data: UpdateStatusFlexibleRequest):
 @app.get("/getStatuses")
 def route_get_statuses(active_only: bool = Query(False), limit: int = Query(0)):
     return get_statuses(active_only, limit)
+
+@app.get("/getPlans")
+def route_get_plans():
+    return get_plans()
+
+@app.get("/getRuns")
+def route_get_runs():
+    return get_runs()
+
+@app.post("/createPlan")
+def route_create_plan(data: CreatePageRequest):
+    return create_page(PLAN_DATABASE_ID, data.properties)
+
+@app.patch("/updatePlan")
+def route_update_plan(data: UpdatePageRequest):
+    return update_page(data.page_id, data.fields)
+
+@app.post("/createRun")
+def route_create_run(data: CreatePageRequest):
+    return create_page(RUN_DATABASE_ID, data.properties)
+
+@app.patch("/updateRun")
+def route_update_run(data: UpdatePageRequest):
+    return update_page(data.page_id, data.fields)
 
 # --- Telegram + OpenAI Assistant endpoint ---
 user_threads = {}
@@ -194,6 +224,18 @@ async def ask(request: Request):
                             result = update_status(UpdateStatusFlexibleRequest(**args))
                         elif fn_name == "getStatuses":
                             result = get_statuses(**args)
+                        elif fn_name == "createPlan":
+                            result = create_page(PLAN_DATABASE_ID, args["properties"])
+                        elif fn_name == "updatePlan":
+                            result = update_page(args["page_id"], args["fields"])
+                        elif fn_name == "createRun":
+                            result = create_page(RUN_DATABASE_ID, args["properties"])
+                        elif fn_name == "updateRun":
+                            result = update_page(args["page_id"], args["fields"])
+                        elif fn_name == "getPlans":
+                            result = get_plans()
+                        elif fn_name == "getRuns":
+                            result = get_runs()
                         else:
                             result = {"error": f"Unknown function: {fn_name}"}
 
